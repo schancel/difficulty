@@ -221,7 +221,7 @@ def compute_cw_target(block_count):
     work = (states[last].chainwork - states[first].chainwork) * 600 // timespan
     return (2 << 255) // work - 1
 
-def next_bits_sha(msg):
+def next_bits_sha(msg, algo):
     primes = [73, 79, 83, 89, 97,
               101, 103, 107, 109, 113, 127,
               131, 137, 139, 149, 151]
@@ -231,8 +231,7 @@ def next_bits_sha(msg):
     # in this simulation
     prime = primes[states[-1].timestamp % len(primes)]
     
-    interval_target = compute_cw_target(prime)
-    return target_to_bits(interval_target)
+    return algo(msg, prime)
 
 def next_bits_cw(msg, block_count):
     interval_target = compute_cw_target(block_count)
@@ -427,7 +426,12 @@ Algos = {
     'cw-144' : Algo(next_bits_cw, {
         'block_count': 144,
     }),
-    'cw-sha-16' : Algo(next_bits_sha, {}),
+    'cw-sha-16' : Algo(next_bits_sha, {
+        'algo': next_bits_cw
+    }),
+    'wt-sha-16' : Algo(next_bits_sha, {
+        'algo': lambda msg, window: next_bits_wt(msg, window, False)
+    }),
     'cw-180' : Algo(next_bits_cw, {
         'block_count': 180,
     }),
