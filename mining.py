@@ -221,15 +221,17 @@ def compute_cw_target(block_count):
     work = (states[last].chainwork - states[first].chainwork) * 600 // timespan
     return (2 << 255) // work - 1
 
-def next_bits_sha(msg, algo):
-    primes = [73, 79, 83, 89, 97,
-              101, 103, 107, 109, 113, 127,
-              131, 137, 139, 149, 151]
+def next_bits_sha(msg, algo, primecount):
+    primes = [73, 79, 83, 89, 97, 101, 103, 107,
+              109, 113, 127, 131, 137, 139, 149, 151,
+              157, 163, 167, 173, 179, 181, 191, 193,
+              197, 199, 211, 223, 227, 229, 233, 239 ]
+    assert(primecount <= len(primes) and primecount >= 0, "invalid samplesize")
 
     # The timestamp % len(primes) is a proxy for previous
     # block SHAx2 % len(primes), but that data is not available
     # in this simulation
-    prime = primes[states[-1].timestamp % len(primes)]
+    prime = primes[states[-1].timestamp % primecount]
     
     return algo(msg, prime)
 
@@ -426,18 +428,28 @@ Algos = {
     'cw-144' : Algo(next_bits_cw, {
         'block_count': 144,
     }),
-    'cw-sha-16' : Algo(next_bits_sha, {
-        'algo': next_bits_cw
-    }),
-    'wt-sha-16' : Algo(next_bits_sha, {
-        'algo': lambda msg, window: next_bits_wt(msg, window, False)
-    }),
     'cw-180' : Algo(next_bits_cw, {
         'block_count': 180,
     }),
     'wt-144' : Algo(next_bits_wt, {
         'block_count': 144,
         'limit_precision' : False
+    }),
+    'cw-sha-16' : Algo(next_bits_sha, {
+        'primecount': 16,
+        'algo': next_bits_cw
+    }),
+    'wt-sha-16' : Algo(next_bits_sha, {
+        'primecount': 16,
+        'algo': lambda msg, window: next_bits_wt(msg, window, False)
+    }),
+    'cw-sha-32' : Algo(next_bits_sha, {
+        'primecount': 32,
+        'algo': next_bits_cw
+    }),
+    'wt-sha-32' : Algo(next_bits_sha, {
+        'primecount': 32,
+        'algo': lambda msg, window: next_bits_wt(msg, window, False)
     }),
     'dgw3-24' : Algo(next_bits_dgw3, { # 24-blocks, like Dash
         'block_count': 24,
