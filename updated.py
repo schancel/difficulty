@@ -82,8 +82,6 @@ GREEDY_HASHRATE = 2000     # In PH/s.
 GREEDY_PCT = 10
 GREEDY_WINDOW = 6
 
-IDEAL_BLOCK_TIME = 10 * 60
-
 State = namedtuple('State', 'height wall_time timestamp bits chainwork fx '
                    'hashrate rev_ratio greedy_frac msg')
 
@@ -99,7 +97,7 @@ def print_state():
     block_time = state.timestamp - states[-2].timestamp
     t = datetime.datetime.fromtimestamp(state.timestamp)
     difficulty = TARGET_1 / bits_to_target(state.bits)
-    implied_diff = TARGET_1 / ((2 << 255) / (state.hashrate * 1e15 * IDEAL_BLOCK_TIME))
+    implied_diff = TARGET_1 / ((2 << 255) / (state.hashrate * 1e15 * 600))
     print(', '.join(['{:d}'.format(state.height),
                      '{:.8f}'.format(state.fx),
                      '{:d}'.format(block_time),
@@ -141,7 +139,7 @@ def next_bits_k(msg, mtp_window, high_barrier, target_raise_frac,
 
     # Long term block production time stabiliser
     t = states[-1].timestamp - states[-2017].timestamp
-    if t < IDEAL_BLOCK_TIME * 2016 * fast_blocks_pct // 100:
+    if t < 600 * 2016 * fast_blocks_pct // 100:
         msg.append("2016 block time difficulty raise")
         target -= target // target_drop_frac
 
@@ -177,13 +175,13 @@ def compute_index_fast(index_last):
         if index_last - index_fast < 5:
             continue
         if (states[index_last].timestamp - states[index_fast].timestamp
-            >= 13 * IDEAL_BLOCK_TIME):
+            >= 13 * 600):
             return index_fast
     raise AssertionError('should not happen')
 
 def compute_target(first_index, last_index):
     work = states[last_index].chainwork - states[first_index].chainwork
-    work *= IDEAL_BLOCK_TIME
+    work *= 600
     work //= states[last_index].timestamp - states[first_index].timestamp
     return (2 << 255) // work - 1
 
@@ -217,140 +215,27 @@ def next_bits_d(msg):
     return target_to_bits(next_target)
 
 def compute_cw_target(block_count):
-    N = len(states) - 1
-    last = suitable_block_index(N)
-    first = suitable_block_index(N - block_count)
+    first, last  = -1-block_count, -1
     timespan = states[last].timestamp - states[first].timestamp
-    timespan = max(block_count * IDEAL_BLOCK_TIME // 2, min(block_count * 2 * IDEAL_BLOCK_TIME, timespan))
-    work = (states[last].chainwork - states[first].chainwork) * IDEAL_BLOCK_TIME // timespan
+    timespan = max(block_count * 600 // 2, min(block_count * 2 * 600, timespan))
+    work = (states[last].chainwork - states[first].chainwork) * 600 // timespan
     return (2 << 255) // work - 1
 
-def next_bits_sha(msg):
-    primes = [73, 79, 83, 89, 97,
-              101, 103, 107, 109, 113, 127,
-              131, 137, 139, 149, 151]
+def next_bits_sha(msg, algo, primecount):
+    primes = [# 13,  17,  19,  23,  29,  31,  37,  41,
+              #43,  47,  73,  79,  83,  89,  97, 101,
+              103, 107, 109, 113, 127, 131, 137, 139,
+              149, 151, 157, 163, 167, 173, 179, 181,
+              191, 193, 197, 199, 211, 223, 227, 229,
+              233, 239, 241, 251, 257, 263, 269, 271 ]
+    assert primecount <= len(primes) and primecount >= 0, "invalid samplesize"
 
     # The timestamp % len(primes) is a proxy for previous
     # block SHAx2 % len(primes), but that data is not available
     # in this simulation
-    prime = primes[states[-1].timestamp % len(primes)]
+    prime = primes[states[-1].timestamp % primecount]
     
-    interval_target = compute_cw_target(prime)
-    return target_to_bits(interval_target)
-
-def next_bits_wave(msg, avgcount):
-    primes = [ # 73,  79,  83,  89,  97, 101,
-              103, 107, 109, 113, 127, 131, 137, 139,
-              149, 151, 157, 163, 167, 173, 179, 181,
-              191, 193, 197, 199, 211, 223, 227, 229 ]
-    assert avgcount <= len(primes) and avgcount >= 0, "invalid samplesize"
-
-    seed = states[-1].timestamp % (len(primes) // avgcount) + 1
-    total_work = 0
-    total_timespan = 0
-    random.seed(states[-1].timestamp)
-
-    for i in range(1, avgcount):
-        prime = random.randrange( 0, len(primes))
-        #prime = random.randrange( (len(primes) // avgcount) * i, (len(primes) // avgcount) * (i+1))
-        work, timespan = wave_data(i, primes[prime])
-        interval_target = (1 << 256) // (work * 600 // timespan) - 1
-        total_work += work
-        total_timespan += timespan
-
-    normalized_work = (total_work * 600) // total_timespan
-    target = (1 << 256) // normalized_work - 1
-    #last_target = bits_to_target(states[-1].bits)
-    #if target > (last_target << 1):
-    #    target = last_target << 1
-    #elif target < (last_target >> 1):
-    #    target = last_target >> 1
-
-    return target_to_bits(target)
-
-def next_bits_wave_random(msg, avgcount):
-    import random
-
-    random.seed(states[-1].timestamp)
-    total_work = 0
-    total_timespan = 0
-    element = 1
-    for i in range(1, avgcount):
-        element = random.randrange(73, 201)
-        work, timespan = wave_data(i, element)
-        total_work += work
-        total_timespan += timespan
-
-    normalized_work = (total_work * 600) // total_timespan
-    target = (1 << 256) // normalized_work - 1
-
-    return target_to_bits(target)
-
-def next_bits_wtema(msg, alpha_recip):
-    # This algorithm is weighted-target exponential moving average.
-    # Target is calculated based on inter-block times weighted by a
-    # progressively decreasing factor for past inter-block times,
-    # according to the parameter alpha.  If the single_block_target SBT is
-    # calculated as:
-    #    SBT = prior_target * block_time / ideal_block_time
-    # then:
-    #    next_target = SBT * α + prior_target * (1 - α)
-    # Substituting and factorizing:
-    #    next_target = prior_target * α / ideal_block_time
-    #                  * (block_time + (1 / α - 1) * ideal_block_time)
-    # We use the reciprocal of alpha as an integer to avoid floating
-    # point arithmetic.  Doing so the above formula maintains precision and
-    # avoids overflows wih large targets in regtest
-    block_time = states[-1].timestamp - states[-2].timestamp
-    block_time = max(IDEAL_BLOCK_TIME // 2, min(2 * IDEAL_BLOCK_TIME, timespan))
-
-    prior_target = bits_to_target(states[-1].bits)
-    next_target = prior_target // (IDEAL_BLOCK_TIME * alpha_recip)
-    next_target *= block_time + IDEAL_BLOCK_TIME * (alpha_recip - 1)
-    return target_to_bits(next_target)
-
-
-def next_bits_wtema_test(msg, alpha_recip):
-    # This algorithm is weighted-target exponential moving average.
-    # Target is calculated based on inter-block times weighted by a
-    # progressively decreasing factor for past inter-block times,
-    # according to the parameter alpha.  If the single_block_target SBT is
-    # calculated as:
-    #    SBT = prior_target * block_time / ideal_block_time
-    # then:
-    #    next_target = SBT * α + prior_target * (1 - α)
-    # Substituting and factorizing:
-    #    next_target = prior_target * α / ideal_block_time
-    #                  * (block_time + (1 / α - 1) * ideal_block_time)
-    # We use the reciprocal of alpha as an integer to avoid floating
-    # point arithmetic.  Doing so the above formula maintains precision and
-    # avoids overflows wih large targets in regtest
-
-
-    block_count = 1
-    ideal_time = IDEAL_BLOCK_TIME * block_count
-    start = len(states) - 1
-    first, last  = suitable_block_index(start - block_count), suitable_block_index(start)
-    timespan = states[last].timestamp - states[first].timestamp
-    block_time = max(block_count * ideal_time // 2, min(block_count * 2 * ideal_time, timespan))
-
-    prior_target = bits_to_target(states[-1].bits)
-    if states[-1].height % 2000 == 0:
-        prior_target = bits_to_target(next_bits_cw(msg, 2000))
-    next_target = prior_target // (ideal_time * alpha_recip)
-    next_target *= block_time + ideal_time * (alpha_recip - 1)
-    return target_to_bits(next_target)
-
-
-def wave_data(start, block_count):
-    start = len(states) - 1
-    first, last  = suitable_block_index(start - block_count), suitable_block_index(start)
-    timespan = states[last].timestamp - states[first].timestamp
-    # Cap limit if something weird happens for 3 blocks in a row
-    timespan = max(block_count * IDEAL_BLOCK_TIME // 2, min(block_count * 2 * IDEAL_BLOCK_TIME, timespan))
-    work = (states[last].chainwork - states[first].chainwork)
-    return work, timespan
-
+    return algo(msg, prime)
 
 def next_bits_avg(msg, algo, avgcount):
     primes = [ 13,  17,  19,  23,  29,  31,  37,  41,
@@ -367,31 +252,107 @@ def next_bits_avg(msg, algo, avgcount):
 
     return target_to_bits(interval_target)
 
+def next_bits_wave(msg, avgcount):
+    primes = [ 13,  17,  19,  23,  29,  31,  37,  41,
+               43,  47,  73,  79,  83,  89,  97, 101,
+              103, 107, 109, 113, 127, 131, 137, 139,
+              149, 151, 157, 163, 167, 173, 179, 181,
+              191, 193, 197, 199, 211, 223, 227, 229 ]
+    assert avgcount <= len(primes) and avgcount >= 0, "invalid samplesize"
 
+    seed = states[-1].timestamp % (len(primes) // avgcount) + 1
+    total_work = 0
+    total_timespan = 0
+    #print("Len primes {}".format(len(primes)))
+    for i in range(1, avgcount):
+        element = len(primes) * i // avgcount +  states[-1].timestamp % (len(primes) // avgcount)
+        #print("Item {}".format(element))
+        work, timespan = wave_data(i, primes[element])
+        interval_target = (1 << 256) // (work * 600 // timespan) - 1
+        total_work += work
+        total_timespan += timespan
+        #print("Target {}".format(interval_target))
+        #print("Work {} Time {}".format(total_work,total_timespan))
+
+    normalized_work = (total_work * 600) // total_timespan
+    target = (1 << 256) // normalized_work - 1
+
+    return target_to_bits(target)
+
+def next_bits_wave_random(msg, avgcount):
+    import random
+
+    random.seed(states[-1].timestamp)
+    total_work = 0
+    total_timespan = 0
+    element = 1
+    for i in range(1, avgcount):
+        element = random.randrange( (144 // avgcount) * i, (144 // avgcount) * (i+1))
+        print("Item {}".format(element))
+        work, timespan = wave_data(i, element)
+        total_work += work
+        total_timespan += timespan
+        #print("Target {}".format(interval_target))
+        #print("Work {} Time {}".format(total_work,total_timespan))
+
+    normalized_work = (total_work * 600) // total_timespan
+    target = (1 << 256) // normalized_work - 1
+
+    #print(target)
+
+    return target_to_bits(target)
+
+
+def wave_data(start, block_count):
+    first, last  = -start - block_count, -start
+    timespan = states[last].timestamp - states[first].timestamp
+    work = (states[last].chainwork - states[first].chainwork)
+    return work, timespan
 
 def next_bits_cw(msg, block_count):
     interval_target = compute_cw_target(block_count)
     return target_to_bits(interval_target)
 
-def next_bits_wt(msg, block_count):
+def next_bits_wt_limited(msg, block_count, limit_precision):
+    limit = 10 ** (3/block_count)
+    next_D = next_target_wt(msg, block_count, limit_precision)
+    last_target = bits_to_target(states[-1].bits)
+    if next_D > last_target*limit:
+        return target_to_bits(next_D)
+    elif next_D < last_target/limit:
+        return target_to_bits(next_D)
+    else:
+        return target_to_bits(next_D)
+
+def next_bits_wt(msg, block_count, limit_precision):
+    target = next_target_wt(msg, block_count, limit_precision)
+    return target_to_bits(target)
+
+def next_target_wt(msg, block_count, limit_precision):
+    DIFF_WEIGHT_PRECISION = 1000000
+
     first, last  = -1-block_count, -1
+    last_target = bits_to_target(states[last].bits)
+    last_target_fixed = last_target // DIFF_WEIGHT_PRECISION
     timespan = 0
     prior_timestamp = states[first].timestamp
     for i in range(first + 1, last + 1):
         target_i = bits_to_target(states[i].bits)
-
         # Prevent negative time_i values
         timestamp = max(states[i].timestamp, prior_timestamp)
         time_i = timestamp - prior_timestamp
         prior_timestamp = timestamp
-        adj_time_i = time_i * target_i # Difficulty weight
+        if limit_precision:
+            adj_time_i = time_i * (target_i // DIFF_WEIGHT_PRECISION) // last_target_fixed
+        else:
+            adj_time_i = time_i * target_i // last_target # Difficulty weight
         timespan += adj_time_i * (i - first) # Recency weight
-
     timespan = timespan * 2 // (block_count + 1) # Normalize recency weight
-    target = timespan // (IDEAL_BLOCK_TIME * block_count)
-    return target_to_bits(target)
+    target = last_target * timespan # Standard retarget
+    target //= 600 * block_count
+    return target
 
-def next_bits_wt_compare(msg, block_count):
+def next_bits_wt_compare(msg, block_count, limit_precision):
     with open("current_state.csv", 'w') as fh:
         for s in states:
             fh.write("%s,%s,%s\n" % (s.height, s.bits, s.timestamp))
@@ -403,7 +364,7 @@ def next_bits_wt_compare(msg, block_count):
     exit_code = process.wait()
 
     next_bits = int(next_bits.decode())
-    next_bits_py = next_bits_wt(msg, block_count)
+    next_bits_py = next_bits_wt(msg, block_count, limit_precision)
     if next_bits != next_bits_py:
         print("ERROR: Bits don't match. External %s, local %s" % (next_bits, next_bits_py))
         assert(next_bits == next_bits_py)
@@ -435,7 +396,7 @@ def next_bits_dgw3(msg, block_count):
         last_block_time = states[block_reading].timestamp
         block_reading -= 1
         i += 1
-    target_time_span = counted_blocks * IDEAL_BLOCK_TIME
+    target_time_span = counted_blocks * 600
     target = past_difficulty_avg
     if actual_time_span < (target_time_span // 3):
         actual_time_span = target_time_span // 3
@@ -459,16 +420,6 @@ def next_bits_m4(msg, window_1, window_2, window_3, window_4):
     interval_target += compute_target(-3 - window_3, -3)
     interval_target += compute_target(-4 - window_4, -4)
     return target_to_bits(interval_target >> 2)
-
-def next_bits_ema(msg, window):
-    block_time          = states[-1].timestamp - states[-2].timestamp
-    block_time          = max(IDEAL_BLOCK_TIME / 100, min(100 * IDEAL_BLOCK_TIME, block_time))          # Crudely dodge problems from ~0/negative/huge block times
-    old_hashrate_est    = TARGET_1 / bits_to_target(states[-1].bits)                                    # "Hashrate estimate" - aka difficulty!
-    block_weight        = 1 - math.exp(-block_time / window)                                            # Weight of last block_time seconds, according to exp moving avg
-    block_hashrate_est  = (IDEAL_BLOCK_TIME / block_time) * old_hashrate_est                            # Eg, if a block takes 2 min instead of 10, we est hashrate was ~5x higher than predicted
-    new_hashrate_est    = (1 - block_weight) * old_hashrate_est + block_weight * block_hashrate_est     # Simple weighted avg of old hashrate est, + block's adjusted hashrate est
-    new_target          = round(TARGET_1 / new_hashrate_est)
-    return target_to_bits(new_target)
 
 def block_time(mean_time):
     # Sample the exponential distn
@@ -518,11 +469,8 @@ def next_step(algo, scenario, fx_jump_factor):
     time = int(block_time(mean_time) + 0.5)
     wall_time = states[-1].wall_time + time
     # Did the difficulty ramp hashrate get the block?
-    if random.random() < (abs(scenario.dr_hashrate) / hashrate):
-        if (scenario.dr_hashrate > 0):
-            timestamp = median_time_past(states[-11:]) + 1
-        else:
-            timestamp = wall_time + 2 * 60 * 60
+    if random.random() < (scenario.dr_hashrate / hashrate):
+        timestamp = median_time_past(states[-11:]) + 1
     else:
         timestamp = wall_time
     # Get a new FX rate
@@ -569,25 +517,50 @@ Algos = {
     'cw-144' : Algo(next_bits_cw, {
         'block_count': 144,
     }),
-    'cw-sha-16' : Algo(next_bits_sha, {}),
+    'cw-180' : Algo(next_bits_cw, {
+        'block_count': 180,
+    }),
+    'wt-144' : Algo(next_bits_wt, {
+        'block_count': 144,
+        'limit_precision' : False
+    }),
+    'wt-30' : Algo(next_bits_wt_limited, {
+        'block_count': 30,
+        'limit_precision' : False
+    }),
+    'ksch-144-5' : Algo(next_bits_wave, {
+        'avgcount': 5,
+    }),
+    'ksch-144-3' : Algo(next_bits_wave, {
+        'avgcount': 3,
+    }),
+    'cw-sha-16' : Algo(next_bits_sha, {
+        'primecount': 16,
+        'algo': next_bits_cw
+    }),
+    'wt-sha-16' : Algo(next_bits_sha, {
+        'primecount': 16,
+        'algo': lambda msg, window: next_bits_wt(msg, window, False)
+    }),
     'cw-avg-16' : Algo(next_bits_avg, {
         'avgcount': 16,
         'algo': compute_cw_target
     }),
-    'cw-180' : Algo(next_bits_cw, {
-        'block_count': 180,
+    'cw-sha-32' : Algo(next_bits_sha, {
+        'primecount': 32,
+        'algo': next_bits_cw
     }),
-    'ksch-5' : Algo(next_bits_wave, {
-        'avgcount': 5,
+    'cw-avg-32' : Algo(next_bits_avg, {
+        'avgcount': 32,
+        'algo': compute_cw_target
     }),
-    'ksch-7' : Algo(next_bits_wave, {
-        'avgcount': 7,
+    'wt-sha-32' : Algo(next_bits_sha, {
+        'primecount': 32,
+        'algo': lambda msg, window: next_bits_wt(msg, window, False)
     }),
-    'r-ksch-5' : Algo(next_bits_wave_random, {
-        'avgcount': 5,
-    }),
-    'wt-144' : Algo(next_bits_wt, {
-        'block_count': 144
+    'cw-sha-48' : Algo(next_bits_sha, {
+        'primecount': 48,
+        'algo': next_bits_cw
     }),
     'dgw3-24' : Algo(next_bits_dgw3, { # 24-blocks, like Dash
         'block_count': 24,
@@ -607,22 +580,8 @@ Algos = {
     }),
     # runs wt-144 in external program, compares with python implementation.
     'wt-144-compare' : Algo(next_bits_wt_compare, {
-        'block_count': 144
-    }),
-    'ema-30min' : Algo(next_bits_ema, { # Exponential moving avg
-        'window': 30 * 60,
-    }),
-    'ema-3h' : Algo(next_bits_ema, {
-        'window': 3 * 60 * 60,
-    }),
-    'ema-1d' : Algo(next_bits_ema, {
-        'window': 24 * 60 * 60,
-    }),
-    'wtema-72' : Algo(next_bits_wtema, {
-        'alpha_recip': 104, # floor(1/(1 - pow(.5, 1.0/72))), # half-life = 72
-    }),
-    'wtema-test-72' : Algo(next_bits_wtema_test, {
-        'alpha_recip': 104, # floor(1/(1 - pow(.5, 1.0/72))), # half-life = 72
+        'block_count': 144,
+        'limit_precision' : True
     })
 }
 
@@ -635,8 +594,7 @@ Scenarios = {
     'dr50' : Scenario(next_fx_random, {}, 50, 0),
     'dr75' : Scenario(next_fx_random, {}, 75, 0),
     'dr100' : Scenario(next_fx_random, {}, 100, 0),
-    'pump-osc' : Scenario(next_fx_ramp, {}, 0, 8000),
-    'ft100' : Scenario(next_fx_random, {}, -100, 0),
+    'pump-osc' : Scenario(next_fx_ramp, {}, 0, 8000)
 }
 
 def run_one_simul(algo, scenario, print_it):
@@ -645,8 +603,8 @@ def run_one_simul(algo, scenario, print_it):
     # Initial state is afer 2020 steady prefix blocks
     N = 2020
     for n in range(-N, 0):
-        state = State(INITIAL_HEIGHT + n, INITIAL_TIMESTAMP + n * IDEAL_BLOCK_TIME,
-                      INITIAL_TIMESTAMP + n * IDEAL_BLOCK_TIME,
+        state = State(INITIAL_HEIGHT + n, INITIAL_TIMESTAMP + n * 600,
+                      INITIAL_TIMESTAMP + n * 600,
                       INITIAL_BCC_BITS, INITIAL_SINGLE_WORK * (n + N + 1),
                       INITIAL_FX, INITIAL_HASHRATE, 1.0, False, '')
         states.append(state)
