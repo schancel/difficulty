@@ -79,8 +79,8 @@ VARIABLE_WINDOW = 6  # No of blocks averaged to determine revenue ratio
 # GREEDY_WINDOW BCC blocks.  It will only bother to switch if it has
 # consistently been GREEDY_PCT more profitable.
 GREEDY_HASHRATE = 2000     # In PH/s.
-GREEDY_PCT = 10
-GREEDY_WINDOW = 6
+GREEDY_PCT = 1
+GREEDY_WINDOW = 0
 
 IDEAL_BLOCK_TIME = 10 * 60
 
@@ -301,7 +301,7 @@ def next_bits_wtema(msg, alpha_recip):
     # We use the reciprocal of alpha as an integer to avoid floating
     # point arithmetic.  Doing so the above formula maintains precision and
     # avoids overflows wih large targets in regtest
-    block_time = states[-1].timestamp - states[-2].timestamp
+    timespan = states[-1].timestamp - states[-2].timestamp
     block_time = max(IDEAL_BLOCK_TIME // 2, min(2 * IDEAL_BLOCK_TIME, timespan))
 
     prior_target = bits_to_target(states[-1].bits)
@@ -470,6 +470,58 @@ def next_bits_ema(msg, window):
     new_target          = round(TARGET_1 / new_hashrate_est)
     return target_to_bits(new_target)
 
+def next_bits_asert_discrete(msg, window, granularity = 144):
+    """Another exponential-decay-based algo that uses integer math instead of exponentiation.  As with asert, we increase difficulty by a fixed amount each time a block is found,
+    and decrease it steadily for the passage of time between found blocks.  But here both adjustments are done in integer math, using the principles that:
+    1. We can discretize "Decrease difficulty steadily by a factor of 1/e over (say) 1 day", into "Decrease difficulty by exactly 1/e^(1/100) for each 1/100 of a day."
+    2. We can closely approximate "difficulty * 1/e^(1/100)", by "(difficulty * 4252231657) >> 32".  (Really, just "difficulty * 99 // 100" would probably do the job too.)
+    The "window" param is meant to invoke the fixed time window of a simple moving average, but here we give it the standard equivalent EMA interpretation: the window is "how old a
+    block has to be (in seconds) for us to discount its weight by a factor of e."  So, instead of 86400 (1 day) meaning "average the block times over the last day," here it means 
+    "in our weighted avg of block times, give a day-old block 1/e the weight of the latest block."  This results in comparable responsiveness to a fixed 1-day window.
+    Given this framework, we update the target as follows:
+    1. Decrease the difficulty (ie, increase the target) by the constant factor we always increase it by for each new block.  (See the ASERT algo for an explanation of this.)
+    2. Adjust the difficulty based on the passage of time (typically increase it, except in the unusual case where this block's timestamp is before the previous block's):
+       a) Specify a granularity - the number of segments we'll divide the time window into.  Eg, window = 86400 and granularity = 100, means segment = 864.
+       b) Figure out which numbered segment (since genesis) the previous block's timestamp fell into, and which segment the current block falls into.
+       c) The difference between the segment numbers of the two blocks tells us how many discrete "per-segment difficulty adjustments" we need to make.  Eg, if the current block
+          lands in the segment 3 segments after the one the previous block did, we need to decrease difficulty by three "segment adjustments".
+       d) Theoretically, if granularity = 100, we should multiply difficulty by e**(-1/100) for each segment.  We can approximate each adjustment by an int-math multiplication, 
+          using the e^(-1/100)*(2**32) in TIME_SEGMENT_DIFFICULTY_DECREASE_FACTOR above.  This means our algo can only time-adjust difficulty by multiples of 1% - but that's OK."""
+
+    FACTOR_SCALING_BITS = 32
+    # These factors are scaled by 2**FACTOR_SCALING_BITS.  Eg, (x * 4252231657) >> 32, is approximately x * e^(-1/100).
+    TIME_SEGMENT_DIFFICULTY_DECREASE_FACTOR = {
+        100: 4252231657,                    # If current block's timestamp is one segment later than previous block's, then multiply difficulty by this number and divide by 2**32.
+    }
+    BLOCK_DIFFICULTY_INCREASE_FACTOR = {
+        144: 4324897261,                    # If window = 144 * IDEAL_BLOCK_TIME, then every time a block is found, multiply difficulty by this number and divide by 2**32.
+    }
+
+    old_segment_number = states[-2].timestamp // (window // granularity)
+    new_segment_number = states[-1].timestamp // (window // granularity)
+    old_target = bits_to_target(states[-1].bits)
+
+    # We divide by the factors here, rather than multiply, because we're actually adjusting target, not difficulty:
+    new_target = (old_target << FACTOR_SCALING_BITS) // BLOCK_DIFFICULTY_INCREASE_FACTOR[window // IDEAL_BLOCK_TIME]
+    if new_segment_number > old_segment_number:
+        # Doing this in a simple for loop means that a pathological block time (far in past or future) could make this very slow.  I'm not sure such blocks ever actually occur,
+        # but if this were a concern we could speed this up via https://en.wikipedia.org/wiki/Exponentiation_by_squaring.  Eg, if the two block times are 20 segments apart, a naive
+        # loop does 20 multiplications/divisions (plus bit-shifts), whereas exp by squaring could do it in 6 as follows:
+        #     e**(2/100)  = (e**(1/100))**2
+        #     e**(4/100)  = (e**(2/100))**2
+        #     e**(8/100)  = (e**(4/100))**2
+        #     e**(16/100) = (e**(8/100))**2
+        #     e**(20/100) = e**(16/100) * e**(4/100)
+        #     new_target = old_target * e**(20/100)
+        # This saving gets significant for large numbers (log vs linear): if the blocks were 1,000,000 segments apart, this would mean 26 multiplications rather than 1,000,000.
+        for _ in range(old_segment_number, new_segment_number):
+            new_target = (new_target << FACTOR_SCALING_BITS) // TIME_SEGMENT_DIFFICULTY_DECREASE_FACTOR[granularity]
+    elif new_segment_number < old_segment_number:                       # If the new block's timestamp is weirdly before the old one's, OK then, *increase* difficulty accordingly
+        for _ in range(new_segment_number, old_segment_number):
+            new_target = (new_target * TIME_SEGMENT_DIFFICULTY_DECREASE_FACTOR[granularity]) >> FACTOR_SCALING_BITS
+
+    return target_to_bits(new_target)
+
 def block_time(mean_time):
     # Sample the exponential distn
     sample = random.random()
@@ -478,6 +530,9 @@ def block_time(mean_time):
 
 def next_fx_random(r):
     return states[-1].fx * (1.0 + (r - 0.5) / 200)
+
+def next_fx_none(r):
+    return states[-1].fx
 
 def next_fx_ramp(r):
     return states[-1].fx * 1.00017149454
@@ -494,8 +549,22 @@ def next_step(algo, scenario, fx_jump_factor):
         (states[-1-144+5].timestamp - states[-1-144].timestamp > scenario.pump_144_threshold)):
         var_fraction = max(var_fraction, .25)
 
+    # Calculate our dynamic difficulty
+    bits = algo.next_bits(msg, **algo.params)
+    target = bits_to_target(bits)
+
+    # Get a new FX rate
+    rand = random.random()
+    fx = scenario.next_fx(rand, **scenario.params)
+    if fx_jump_factor != 1.0:
+        msg.append('FX jumped by factor {:.2f}'.format(fx_jump_factor))
+        fx *= fx_jump_factor
+
     N = GREEDY_WINDOW
-    gready_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
+    rev_ratio = revenue_ratio(fx, target)
+    if N > 0:
+        gready_rev_ratio = sum(state.rev_ratio for state in states[-N:]) / N
+    
     greedy_frac = states[-1].greedy_frac
     if mean_rev_ratio >= 1 + GREEDY_PCT / 100:
         if greedy_frac != 0.0:
@@ -509,9 +578,7 @@ def next_step(algo, scenario, fx_jump_factor):
     hashrate = (STEADY_HASHRATE + scenario.dr_hashrate
                 + VARIABLE_HASHRATE * var_fraction
                 + GREEDY_HASHRATE * greedy_frac)
-    # Calculate our dynamic difficulty
-    bits = algo.next_bits(msg, **algo.params)
-    target = bits_to_target(bits)
+
     # See how long we take to mine a block
     mean_hashes = pow(2, 256) // target
     mean_time = mean_hashes / (hashrate * 1e15)
@@ -525,13 +592,6 @@ def next_step(algo, scenario, fx_jump_factor):
             timestamp = wall_time + 2 * 60 * 60
     else:
         timestamp = wall_time
-    # Get a new FX rate
-    rand = random.random()
-    fx = scenario.next_fx(rand, **scenario.params)
-    if fx_jump_factor != 1.0:
-        msg.append('FX jumped by factor {:.2f}'.format(fx_jump_factor))
-        fx *= fx_jump_factor
-    rev_ratio = revenue_ratio(fx, target)
 
     chainwork = states[-1].chainwork + bits_to_work(bits)
 
@@ -623,13 +683,18 @@ Algos = {
     }),
     'wtema-test-72' : Algo(next_bits_wtema_test, {
         'alpha_recip': 104, # floor(1/(1 - pow(.5, 1.0/72))), # half-life = 72
-    })
+    }),
+    'asertd-144' : Algo(next_bits_asert_discrete, {
+        'window': (IDEAL_BLOCK_TIME * 144),
+        'granularity': 100,
+    }),
 }
 
 Scenario = namedtuple('Scenario', 'next_fx params, dr_hashrate, pump_144_threshold')
 
 Scenarios = {
     'default' : Scenario(next_fx_random, {}, 0, 0),
+    'none': Scenario(next_fx_none, {}, 0, 0),
     'fxramp' : Scenario(next_fx_ramp, {}, 0, 0),
     # Difficulty rampers with given PH/s
     'dr50' : Scenario(next_fx_random, {}, 50, 0),
